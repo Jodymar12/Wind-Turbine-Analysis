@@ -1,67 +1,71 @@
-% Authors: Oluwateniola Adekunle-Awomuti, Purav Alva, Tate Dailey
-% ME 4053 – Wind Turbine Analysis
+% Authors: Teni Adekunle Awomuti, Purav Alva, Tate Dailey
+% Course: ME 4053 – Wind Turbine Analysis
 % Date: October 30th 2025
-% Description:
-%   Modelling a aerodynamic and performing structural analysis of the Clipper C96 2.5 MW wind turbine.
 
+% Group Parameters:
+%   Q1 (Deliverable 1): Test case -> U = 10 m/s, rpm = 14, pitch = 0 deg
+%   Q2 (Deliverable 2): U = 6.6 m/s, TSR λ = 6.09 (compute rpm from λ)
+%   Q3 (Deliverable 3): U = 7.1 m/s (sweep β and λ, rpm cap 15.5)
+%   Q4 (Deliverable 4): Rated control around U = 19.4 m/s (rpm fixed 15.5)
+%   Q5 (Deliverable 5): Tower analysis uses Fz from D4 (here kept at 1.65e5 N)
+%
+% Dependencies in same folder:
+%   BladeProfile.csv
+%   DU91-W2-250.csv, DU93-W-210.csv, DU96-W-180.csv, DU97-W-300.csv
+%   towerSpecs.csv
+%
+% Outputs:
+%   D1_section_outputs.csv
+%   D4_pitch_vs_wind.csv
+% -------------------------------------------------------------------------
 
 clear; clc; close all;
 
-%% ------------------------- GLOBAL SETTINGS -----------------------------
-groupWindSpeed = 19.4;    % group wind speed [m/s]
-rho = 1.1;                % air density [kg/m^3]
-mu  = 1.8e-5;             % dynamic viscosity [Pa·s]
-B   = 3;                  % number of blades
-
+%% --------------------- GLOBAL SETTINGS (shared) ------------------------
+rho = 1.1;              % air density [kg/m^3]
+mu  = 1.8e-5;           % dynamic viscosity [Pa·s]
+B   = 3;                % blades
 bladeFile  = 'BladeProfile.csv';
 polarFiles = {'DU91-W2-250.csv','DU93-W-210.csv','DU96-W-180.csv','DU97-W-300.csv'};
+% BEM numerical params
+tol = 1e-5; max_it = 300; relax = 0.3; hub_cut_frac = 0.05; cap_a = 0.95;
 
-% Shared BEM solver parameters
-tol = 1e-5;          % convergence tolerance
-max_it = 300;        % max iterations per element
-relax = 0.3;         % relaxation for a, a'
-hub_cut_frac = 0.05; % ignore innermost 5% of span
-cap_a = 0.95;        % axial induction cap
+% Small helper for polars key
+mapKey = @(s) lower(strrep(s,'-',''));
 
 %% -------------------------- DELIVERABLE 1 ------------------------------
-% Given test case: U = 10 m/s, rpm = 14, pitch = 0°
+% Baseline test case: U = 10 m/s, rpm = 14, pitch = 0 deg
+U_inf = 10; rpm = 14; pitch_deg = 0;
 
-U_inf = 10;                   % free-stream [m/s]
-rpm   = 14;                   % rotor speed [rev/min]
-pitch_deg = 0;                % blade pitch [deg]
-
-% Blade geometry
+% Geometry
 T = readtable(bladeFile);
-r  = T.DistanceFromCenterOfRotation/1000;    % [m]
-c  = T.ChordLength/1000;                     % [m]
-tw = deg2rad(T.BladeTwist);                  % [rad]
+r  = T.DistanceFromCenterOfRotation/1000;     % [m]
+c  = T.ChordLength/1000;                      % [m]
+tw = deg2rad(T.BladeTwist);                   % [rad]
 airfoils = strtrim(string(T.Airfoil));
 
-% Sort and trim hub
+% Sort + cut hub
 [r, idx] = sort(r); c = c(idx); tw = tw(idx); airfoils = airfoils(idx);
-R = max(r); A = pi*R^2;
-omega = rpm*2*pi/60;              % [rad/s]
-lambda = omega*R/U_inf;           % TSR (tip speed ratio)
+R = max(r); A = pi*R^2; omega = rpm*2*pi/60; lambda = omega*R/U_inf;
 mask = r > hub_cut_frac*R;
 r = r(mask); c = c(mask); tw = tw(mask); airfoils = airfoils(mask);
 N = numel(r);
-dr = diff(r); dr = [dr; dr(end)]; % repeat last interval
 
-% Airfoil polars
+% Load polars
 polars = struct();
 for k = 1:numel(polarFiles)
     f = polarFiles{k};
     if ~isfile(f), warning('Missing polar file %s',f); continue; end
     D = readtable(f);
     [~,base] = fileparts(f);
-    key = lower(strrep(base,'-',''));
-    polars.(key).alpha = D.AoA;   % AoA [deg]
+    key = mapKey(base);
+    polars.(key).alpha = D.AoA;
     polars.(key).Cl    = D.CL;
     polars.(key).Cd    = D.CD;
 end
-mapKey = @(s) lower(strrep(s,'-',''));
 
-% BEM along the span
+% Spanwise BEM
+dr = diff(r); dr = [dr; dr(end)];
 pitch = deg2rad(pitch_deg);
 a_vec = zeros(N,1); ap_vec = zeros(N,1);
 dT = zeros(N,1); dQ = zeros(N,1);
@@ -69,152 +73,121 @@ Cl_v = zeros(N,1); Cd_v = zeros(N,1);
 
 for i = 1:N
     ri = r(i); ci = c(i); twi = tw(i);
-    air = airfoils(i);
+    air = airfoils(i); isCircle = strcmpi(air,'circle');
     polKey = mapKey(air); hasPolar = isfield(polars,polKey);
-    isCircle = strcmpi(air,'circle');
-
-    a = 0.3; ap = 0; % initial guess
+    a = 0.3; ap = 0;
     for it = 1:max_it
-        Vax = U_inf*(1 - a);
-        Vtan = omega*ri*(1 + ap);
-        phi  = atan2(Vax, Vtan);
+        Vax = U_inf*(1-a); Vtan = omega*ri*(1+ap);
+        phi = atan2(Vax,Vtan);
         alpha_deg = rad2deg(phi - (twi + pitch));
-
-        % Cl/Cd lookup 
         if ~isCircle && hasPolar
             P = polars.(polKey);
-            Cl = interp1(P.alpha, P.Cl, alpha_deg, 'linear', 'extrap');
-            Cd = interp1(P.alpha, P.Cd, alpha_deg, 'linear', 'extrap');
+            Cl = interp1(P.alpha,P.Cl,alpha_deg,'linear','extrap');
+            Cd = interp1(P.alpha,P.Cd,alpha_deg,'linear','extrap');
         elseif ~isCircle && ~hasPolar
             [Cl,Cd] = fallbackPolar(alpha_deg);
         else
             Re = rho*U_inf*ci/mu; Cl = 0; Cd = cylinderCD(Re);
         end
-
-        % Local coefficients and solidity
         Cn = Cl*cos(phi) + Cd*sin(phi);
-        Ct = Cl*sin(phi) - Cd*cos(phi);
+        Ct_loc = Cl*sin(phi) - Cd*cos(phi);
         sigma = B*ci/(2*pi*ri);
-
-        % Prandtl tip-loss
-        f = (B/2)*(R - ri)/(ri*max(abs(sin(phi)),1e-6));
+        f = (B/2)*(R-ri)/(ri*max(abs(sin(phi)),1e-6));
         F = (2/pi)*acos(exp(-f)); F = max(F,1e-6);
-
-        % Updating Induction 
-        a_new  = 1/(1 + (4*F*sin(phi)^2)/(sigma*max(Cn,1e-6)));
-        ap_new = 1/((4*F*sin(phi)*cos(phi))/(sigma*max(Ct,1e-6)) - 1);
-
-        % Relax + bounds
-        a  = (1 - relax)*a  + relax*a_new;  a  = min(max(a,0),cap_a);
-        ap = (1 - relax)*ap + relax*ap_new; ap = min(max(ap,-0.5),1.0);
+        a_new  = 1/(1+(4*F*sin(phi)^2)/(sigma*max(Cn,1e-6)));
+        ap_new = 1/((4*F*sin(phi)*cos(phi))/(sigma*max(Ct_loc,1e-6))-1);
+        a  = (1-relax)*a  + relax*a_new;  a  = min(max(a,0),cap_a);
+        ap = (1-relax)*ap + relax*ap_new; ap = min(max(ap,-0.5),1.0);
         if abs(a-a_new)<tol && abs(ap-ap_new)<tol, break; end
     end
-
-    % Section forces
-    Vrel = hypot(U_inf*(1 - a), omega*ri*(1 + ap));
-    dL = 0.5*rho*Vrel^2*ci*Cl;
-    dD = 0.5*rho*Vrel^2*ci*Cd;
+    Vrel = hypot(U_inf*(1-a), omega*ri*(1+ap));
+    dL = 0.5*rho*Vrel^2*ci*Cl; dD = 0.5*rho*Vrel^2*ci*Cd;
     dFx = dL*cos(phi) + dD*sin(phi);
     dFt = (~isCircle)*(dL*sin(phi) - dD*cos(phi));
-    dT(i) = B*dFx;
-    dQ(i) = B*dFt*ri;
-    Cl_v(i)=Cl; Cd_v(i)=Cd;
-    a_vec(i)=a; ap_vec(i)=ap;
+    dT(i) = B*dFx; dQ(i) = B*dFt*ri;
+    Cl_v(i)=Cl; Cd_v(i)=Cd; a_vec(i)=a; ap_vec(i)=ap;
 end
 
-% Totals and coefficients
-T_total = trapz(r, dT);
-Q_total = trapz(r, dQ);
+% Totals
+T_total = trapz(r,dT);
+Q_total = trapz(r,dQ);
 P1 = omega*Q_total;
 Cp1 = P1/(0.5*rho*A*U_inf^3);
 Ct1 = T_total/(0.5*rho*A*U_inf^2);
 
-% Minimal console summary
+% Print & plot & save
+disp('--- Deliverable 1 ---');
 disp(['TSR = ', num2str(lambda)]);
 disp(['Cp = ', num2str(Cp1), ', Ct = ', num2str(Ct1)]);
 
-% Plots
 figure;
 subplot(1,2,1);
-plot(r, dQ, '-o', 'LineWidth', 1.5);
-grid on; box on; set(gca,'FontSize',12);
-xlabel('Radius r (m)'); ylabel('dQ (N·m)');
+plot(r,dQ,'-o','LineWidth',1.5); grid on; box on;
+xlabel('r (m)'); ylabel('dQ (N·m)');
 title('Deliverable 1 – Torque Distribution');
-
 subplot(1,2,2);
-plot(r, Cl_v, '-o', 'LineWidth', 1.5); hold on;
-plot(r, Cd_v, '-s', 'LineWidth', 1.5);
-grid on; box on; set(gca,'FontSize',12);
-xlabel('Radius r (m)'); ylabel('Coefficient');
+plot(r,Cl_v,'-o','LineWidth',1.5); hold on;
+plot(r,Cd_v,'-s','LineWidth',1.5); grid on; box on;
+xlabel('r (m)'); ylabel('Coeff');
 legend('C_l','C_d','Location','best');
-title('Deliverable 1 – Section Cl and Cd');
+title('Deliverable 1 – Section Cl & Cd');
 
-% Save per-section data
 sec = table(r,c,rad2deg(tw),airfoils,a_vec,ap_vec,Cl_v,Cd_v,dT,dQ, ...
     'VariableNames',{'r_m','chord_m','twist_deg','airfoil','a','ap','Cl','Cd','dT','dQ'});
-writetable(sec,'D1_section_outputs.csv');
+writetable(sec, fullfile(pwd,'D1_section_outputs.csv'));
 
 %% -------------------------- DELIVERABLE 2 ------------------------------
-% Cp vs pitch at group parameter wind speed (U = 19.4 m/s), chosen rpm = 15.5
-
-U_inf = groupWindSpeed;
-rpm   = 15.5;
-omega = rpm*2*pi/60;
-
-% Geometry
+% Group parameters: U = 6.6 m/s, TSR λ = 6.09
+U_inf = 6.6; lambda = 6.09;
+% Geometry (for R)
 T = readtable(bladeFile);
-r  = T.DistanceFromCenterOfRotation/1000; c = T.ChordLength/1000;
+R_all = max(T.DistanceFromCenterOfRotation)/1000;
+omega = lambda*U_inf/R_all; rpm = omega*60/(2*pi);
+
+% Rebuild geometry arrays
+r  = T.DistanceFromCenterOfRotation/1000; c  = T.ChordLength/1000;
 tw = deg2rad(T.BladeTwist); airfoils = strtrim(string(T.Airfoil));
-[r, idx] = sort(r); c = c(idx); tw = tw(idx); airfoils = airfoils(idx);
-R = max(r); A = pi*R^2; lambda = omega*R/U_inf;
+[r,idx] = sort(r); c = c(idx); tw = tw(idx); airfoils = airfoils(idx);
+R = max(r); A = pi*R^2;
 mask = r > hub_cut_frac*R; r=r(mask); c=c(mask); tw=tw(mask); airfoils=airfoils(mask);
 
-% Polars
+% Load polars
 polars = struct();
 for k = 1:numel(polarFiles)
     f = polarFiles{k};
     if ~isfile(f), warning('Missing polar file %s',f); continue; end
     D = readtable(f);
     [~,base] = fileparts(f);
-    key = lower(strrep(base,'-',''));
+    key = mapKey(base);
     polars.(key).alpha = D.AoA; polars.(key).Cl = D.CL; polars.(key).Cd = D.CD;
 end
-mapKey = @(s) lower(strrep(s,'-',''));
 
-% Sweep pitch
 pitch_range = -5:1:20;
 Cp_list = zeros(length(pitch_range),1);
 for p = 1:length(pitch_range)
-    pitch_deg = pitch_range(p);
-    Cp_list(p) = computeCp(U_inf,pitch_deg,omega,r,c,tw,airfoils,polars,mapKey, ...
-                           B,rho,mu,R,A,tol,max_it,relax,cap_a);
+    Cp_list(p) = computeCp(U_inf, pitch_range(p), omega, r,c,tw,airfoils,polars,mapKey,B,rho,mu,R,A,tol,max_it,relax,cap_a);
 end
-
-% Report and plot
-[maxCp2, idx2] = max(Cp_list); bestPitch2 = pitch_range(idx2);
+[maxCp2,idx2] = max(Cp_list); bestPitch2 = pitch_range(idx2);
+disp('--- Deliverable 2 ---');
 disp(['Max Cp = ', num2str(maxCp2), ' at pitch = ', num2str(bestPitch2), ' deg']);
 
 figure;
-plot(pitch_range, Cp_list, '-o', 'LineWidth', 1.5);
-grid on; box on; set(gca,'FontSize',12);
-xlabel('Pitch (deg)'); ylabel('C_p');
-title(sprintf('Deliverable 2 – C_p vs Pitch (U = %.1f m/s, TSR = %.2f)',U_inf,lambda));
+plot(pitch_range,Cp_list,'-o','LineWidth',1.5); grid on; box on;
+xlabel('Pitch \beta (deg)'); ylabel('C_p');
+title(sprintf('Deliverable 2 – C_p vs Pitch (U=%.2f m/s, \\lambda=%.2f, rpm=%.2f)',U_inf,lambda,rpm));
 
 %% -------------------------- DELIVERABLE 3 ------------------------------
-% Cp surface vs pitch and TSR at group wind speed. rpm capped at 15.5.
-
-U_inf = groupWindSpeed;
-pitch_range = -2:1:20;        % [deg]
-lambda_range = 3:0.5:9;       % TSR
-rpm_max = 15.5;
+% Group parameter: U = 7.1 m/s
+U_inf = 7.1;
+pitch_range = -2:1:20; lambda_range = 3:0.5:9; rpm_max = 15.5;
 
 % Geometry
 T = readtable(bladeFile);
-r  = T.DistanceFromCenterOfRotation/1000; c = T.ChordLength/1000;
-twist = deg2rad(T.BladeTwist); airfoils = strtrim(string(T.Airfoil));
-[r, idx] = sort(r); c = c(idx); twist = twist(idx); airfoils = airfoils(idx);
-R = max(r); A = pi*R^2;
-mask = r > hub_cut_frac*R; r=r(mask); c=c(mask); twist=twist(mask); airfoils=airfoils(mask);
+r  = T.DistanceFromCenterOfRotation/1000; c  = T.ChordLength/1000;
+tw = deg2rad(T.BladeTwist); airfoils = strtrim(string(T.Airfoil));
+[r,idx] = sort(r); c=c(idx); tw=tw(idx); airfoils=airfoils(idx);
+R = max(r); A = pi*R^2; mask=r>hub_cut_frac*R;
+r=r(mask); c=c(mask); tw=tw(mask); airfoils=airfoils(mask);
 
 % Polars
 polars = struct();
@@ -223,75 +196,56 @@ for k = 1:numel(polarFiles)
     if ~isfile(f), warning('Missing polar file %s',f); continue; end
     D = readtable(f);
     [~,base] = fileparts(f);
-    key = lower(strrep(base,'-',''));
+    key = mapKey(base);
     polars.(key).alpha = D.AoA; polars.(key).Cl = D.CL; polars.(key).Cd = D.CD;
 end
-mapKey = @(s) lower(strrep(s,'-',''));
 
-% Compute Cp over grid (skip TSR that exceed rpm_max)
 Cp_mat = nan(length(pitch_range), length(lambda_range));
 for ip = 1:length(pitch_range)
     for il = 1:length(lambda_range)
         lambda = lambda_range(il);
-        omega  = lambda*U_inf/R;
-        rpm    = omega*60/(2*pi);
+        omega = lambda*U_inf/R;
+        rpm = omega*60/(2*pi);
         if rpm > rpm_max, continue; end
-        [Cp_mat(ip,il),~] = runBEM_once(U_inf,r,c,twist,airfoils,polars,mapKey, ...
-                                        B,rho,mu,pitch_range(ip),omega,R,A, ...
-                                        tol,max_it,relax,cap_a);
+        [Cp_mat(ip,il),~] = runBEM_once(U_inf,r,c,tw,airfoils,polars,mapKey,B,rho,mu,pitch_range(ip),omega,R,A,tol,max_it,relax,cap_a);
     end
 end
-
-% Best operating point (if any)
 [maxCp3, idx3] = max(Cp_mat(:));
-[ip3, il3] = ind2sub(size(Cp_mat), idx3);
-if ~isnan(maxCp3)
-    disp(['Max Cp = ', num2str(maxCp3), ' at pitch = ', num2str(pitch_range(ip3)), ...
-          ' deg, TSR = ', num2str(lambda_range(il3))]);
-end
+[ip3, il3] = ind2sub(size(Cp_mat),idx3);
+disp('--- Deliverable 3 ---');
+disp(['Max Cp = ', num2str(maxCp3), ' at pitch = ', num2str(pitch_range(ip3)), ', TSR = ', num2str(lambda_range(il3))]);
 
-% Plot surface
 figure;
-[X,Y] = meshgrid(lambda_range, pitch_range);
-surf(X,Y,Cp_mat,'EdgeColor','none');
-grid on; box on; set(gca,'FontSize',12);
-xlabel('TSR \lambda'); ylabel('Pitch (deg)'); zlabel('C_p');
-title('Deliverable 3 – C_p vs \lambda and Pitch');
-colorbar;
+[X,Y] = meshgrid(lambda_range,pitch_range);
+surf(X,Y,Cp_mat,'EdgeColor','none'); grid on; box on; colorbar;
+xlabel('TSR \lambda'); ylabel('Pitch \beta (deg)'); zlabel('C_p');
+title(sprintf('Deliverable 3 – C_p(\\lambda, \\beta) Surface (U=%.2f m/s)',U_inf));
 
 %% -------------------------- DELIVERABLE 4 ------------------------------
-% Pitch control to hold rated power (2.5 MW). rpm fixed at 15.5.
+% Rated control: rpm fixed 15.5, power 2.5 MW, sweep U = 11..25 m/s
+P_rated = 2.5e6; rpm_fix = 15.5; omega_fix = rpm_fix*2*pi/60;
+U_list = 11:1:25;  % includes 19.4 m/s
 
-P_rated = 2.5e6;             % [W]
-rpm_fix = 15.5;              % [rpm]
-omega_fix = rpm_fix*2*pi/60; % [rad/s]
-U_list = 11:1:25;            % wind speeds [m/s]
-pitch_lo_deg = 0; pitch_hi_deg = 25;
-
-% Geometry
+% Geometry (once)
 T = readtable(bladeFile);
-r_all  = T.DistanceFromCenterOfRotation/1000; c_all = T.ChordLength/1000;
+r_all = T.DistanceFromCenterOfRotation/1000; c_all = T.ChordLength/1000;
 tw_all = deg2rad(T.BladeTwist); af_all = strtrim(string(T.Airfoil));
-[r_all, idx] = sort(r_all); c_all=c_all(idx); tw_all=tw_all(idx); af_all=af_all(idx);
+[r_all,idx] = sort(r_all); c_all=c_all(idx); tw_all=tw_all(idx); af_all=af_all(idx);
 R = max(r_all); A = pi*R^2;
 mask = r_all > hub_cut_frac*R;
 r = r_all(mask); c = c_all(mask); tw = tw_all(mask); afs = af_all(mask);
 
-% Polars 
+% Polars (once)
 polars = struct();
 for k = 1:numel(polarFiles)
     f = polarFiles{k};
     if ~isfile(f), warning('Missing polar file %s',f); continue; end
     D = readtable(f);
     [~,base] = fileparts(f);
-    key = lower(strrep(base,'-',''));
-    polars.(key).alpha = D.AoA;
-    polars.(key).Cl    = D.CL;
-    polars.(key).Cd    = D.CD;
+    key = mapKey(base);
+    polars.(key).alpha = D.AoA; polars.(key).Cl = D.CL; polars.(key).Cd = D.CD;
 end
-mapKey = @(s) lower(strrep(s,'-',''));
 
-% Storage
 Pitch_req = nan(size(U_list));
 Cp_at_req = nan(size(U_list));
 Ct_at_req = nan(size(U_list));
@@ -299,39 +253,32 @@ P_at_req  = nan(size(U_list));
 T_at_req  = nan(size(U_list));
 lambda_at_req = nan(size(U_list));
 
-% Bisection per wind speed
 for k = 1:numel(U_list)
     U = U_list(k);
-    getPowerAtPitch = @(pitch_deg) ...
-        bem_power_at_pitch(U, pitch_deg, omega_fix, r,c,tw,afs,polars,mapKey, ...
-                           B,rho,mu,R,A,tol,max_it,relax,cap_a);
-
-    [Cp0,Ct0,P0,T0] = getPowerAtPitch(pitch_lo_deg);
-    [CpH,CtH,PH,TH] = getPowerAtPitch(pitch_hi_deg);
-
+    getPowerAtPitch = @(pitch_deg) bem_power_at_pitch(U,pitch_deg,omega_fix, ...
+        r,c,tw,afs,polars,mapKey,B,rho,mu,R,A,tol,max_it,relax,cap_a);
+    [Cp0,Ct0,P0,T0] = getPowerAtPitch(0);
+    [CpH,CtH,PH,TH] = getPowerAtPitch(25);
     if P0 <= P_rated
-        Pitch_req(k)=pitch_lo_deg; Cp_at_req(k)=Cp0; Ct_at_req(k)=Ct0;
-        P_at_req(k)=P0; T_at_req(k)=T0; lambda_at_req(k)=(omega_fix*R)/U; continue;
+        Pitch_req(k)=0; Cp_at_req(k)=Cp0; Ct_at_req(k)=Ct0; P_at_req(k)=P0; T_at_req(k)=T0;
+        lambda_at_req(k)=(omega_fix*R)/U; continue;
     end
     if PH > P_rated
-        Pitch_req(k)=NaN; Cp_at_req(k)=NaN; Ct_at_req(k)=NaN;
-        P_at_req(k)=PH; T_at_req(k)=TH; lambda_at_req(k)=(omega_fix*R)/U; continue;
+        Pitch_req(k)=NaN; Cp_at_req(k)=NaN; Ct_at_req(k)=NaN; P_at_req(k)=PH; T_at_req(k)=TH;
+        lambda_at_req(k)=(omega_fix*R)/U; continue;
     end
-
-    lo=pitch_lo_deg; hi=pitch_hi_deg; CpM=NaN; CtM=NaN; PM=NaN; Tmid=NaN;
+    lo=0; hi=25; CpM=NaN; CtM=NaN; PM=NaN; Tmid=NaN;
     for iter=1:40
         mid=0.5*(lo+hi);
-        [CpM,CtM,PM,Tmid]=getPowerAtPitch(mid);
-        if PM>P_rated, lo=mid; else, hi=mid; end
-        if abs(hi-lo)<1e-3, break; end
+        [CpM,CtM,PM,Tmid] = getPowerAtPitch(mid);
+        if PM > P_rated, lo = mid; else, hi = mid; end
+        if abs(hi-lo) < 1e-3, break; end
     end
-
-    Pitch_req(k)=hi; Cp_at_req(k)=CpM; Ct_at_req(k)=CtM;
-    P_at_req(k)=PM; T_at_req(k)=Tmid;
+    Pitch_req(k)=hi; Cp_at_req(k)=CpM; Ct_at_req(k)=CtM; P_at_req(k)=PM; T_at_req(k)=Tmid;
     lambda_at_req(k)=(omega_fix*R)/U;
 end
 
-% Compact printout
+disp('--- Deliverable 4 ---');
 disp('U (m/s)   Pitch (deg)   Cp     Ct     P (MW)   TSR    Thrust (N)');
 for k=1:numel(U_list)
     fprintf('%6.1f   %11.3f  %6.4f %6.4f  %7.3f  %6.3f  %10.1f\n', ...
@@ -339,19 +286,17 @@ for k=1:numel(U_list)
         P_at_req(k)/1e6, lambda_at_req(k), T_at_req(k));
 end
 
-% Save CSV
 T_out = table(U_list(:),Pitch_req(:),Cp_at_req(:),Ct_at_req(:), ...
               P_at_req(:),lambda_at_req(:),T_at_req(:), ...
               'VariableNames',{'U_ms','pitch_deg','Cp','Ct','P_W','lambda','ThrustN'});
-writetable(T_out,'D4_pitch_vs_wind.csv');
+writetable(T_out, fullfile(pwd,'D4_pitch_vs_wind.csv'));
 
 %% -------------------------- DELIVERABLE 5 ------------------------------
-% Tower structural and fatigue analysis using fixed Fz = 1.65e5 N
-WindTurbineTower_Analysis();
+% Tower structural & fatigue (uses fixed Fz from D4)
+WindTurbineTower_Analysis();   % prints max deflection explicitly
 
-%% ---------------------------- FUNCTIONS --------------------------------
+%% ============================= HELPERS ================================
 function [Cl,Cd] = fallbackPolar(alpha_deg)
-% Basic fallback if a polar file is missing.
 a = deg2rad(alpha_deg);
 Cl = 2*pi*a; Cl = max(min(Cl,1.2),-1.2);
 Cd = 0.01 + 0.02*(abs(alpha_deg)/10);
@@ -369,31 +314,19 @@ else
 end
 end
 
-function Cp = computeCp(U,pitch_deg,omega,r,c,tw,airfoils,polars,mapKey, ...
-                         B,rho,mu,R,A,tol,max_it,relax,cap_a)
-[Cp,~] = runBEM_once(U,r,c,tw,airfoils,polars,mapKey, ...
-                     B,rho,mu,pitch_deg,omega,R,A,tol,max_it,relax,cap_a);
-end
-
-function [Cp,Ct] = runBEM_once(U_inf,r,c,twist,airfoils,polars,mapKey, ...
+function [Cp,Ct] = runBEM_once(U_inf,r,c,tw,airfoils,polars,mapKey, ...
                                B,rho,mu,pitch_deg,omega,R,A,tol,max_it,relax,cap_a)
-% BEM solution returning Cp and Ct for one operating point.
 N = numel(r);
-dr = diff(r); dr = [dr; dr(end)];
 pitch = deg2rad(pitch_deg);
 dT = zeros(N,1); dQ = zeros(N,1);
-
 for i = 1:N
-    ri = r(i); ci = c(i); tw = twist(i); air = airfoils(i);
+    ri = r(i); ci = c(i); twi = tw(i); air = airfoils(i);
     isCircle = strcmpi(air,'circle');
     polKey = mapKey(air); hasPolar = isfield(polars,polKey);
     a=0.3; ap=0;
-    for it = 1:max_it
-        Vax = U_inf*(1-a);
-        Vtan = omega*ri*(1+ap);
-        phi = atan2(Vax,Vtan);
-        alpha_deg = rad2deg(phi - (tw + pitch));
-
+    for it=1:max_it
+        Vax = U_inf*(1-a); Vtan = omega*ri*(1+ap); phi = atan2(Vax,Vtan);
+        alpha_deg = rad2deg(phi - (twi + pitch));
         if ~isCircle && hasPolar
             P = polars.(polKey);
             Cl = interp1(P.alpha,P.Cl,alpha_deg,'linear','extrap');
@@ -401,57 +334,48 @@ for i = 1:N
         elseif ~isCircle && ~hasPolar
             [Cl,Cd] = fallbackPolar(alpha_deg);
         else
-            Re = rho*U_inf*ci/mu; Cd = cylinderCD(Re); Cl = 0;
+            Re = rho*U_inf*ci/mu; Cl = 0; Cd = cylinderCD(Re);
         end
-
         Cn = Cl*cos(phi) + Cd*sin(phi);
         Ct_loc = Cl*sin(phi) - Cd*cos(phi);
         sigma = B*ci/(2*pi*ri);
-
         f = (B/2)*(R-ri)/(ri*max(abs(sin(phi)),1e-6));
         F = (2/pi)*acos(exp(-f)); F = max(F,1e-6);
-
         a_new = 1/(1+(4*F*sin(phi)^2)/(sigma*max(Cn,1e-6)));
-        ap_new = 1/((4*F*sin(phi)*cos(phi))/(sigma*max(Ct_loc,1e-6))-1);
-
-        a = (1-relax)*a + relax*a_new;  a = min(max(a,0),cap_a);
+        ap_new= 1/((4*F*sin(phi)*cos(phi))/(sigma*max(Ct_loc,1e-6))-1);
+        a  = (1-relax)*a  + relax*a_new;  a  = min(max(a,0),cap_a);
         ap = (1-relax)*ap + relax*ap_new; ap = min(max(ap,-0.5),1.0);
-
         if abs(a-a_new)<tol && abs(ap-ap_new)<tol, break; end
     end
-
     Vrel = hypot(U_inf*(1-a), omega*ri*(1+ap));
-    dL = 0.5*rho*Vrel^2*ci*Cl;
-    dD = 0.5*rho*Vrel^2*ci*Cd;
+    dL = 0.5*rho*Vrel^2*ci*Cl; dD = 0.5*rho*Vrel^2*ci*Cd;
     dFx = dL*cos(phi) + dD*sin(phi);
-    if isCircle, dFt = 0; else, dFt = dL*sin(phi) - dD*cos(phi); end
+    dFt = (~isCircle)*(dL*sin(phi) - dD*cos(phi));
     dT(i) = B*dFx; dQ(i) = B*dFt*ri;
 end
-
-T_total = trapz(r,dT);
-Q_total = trapz(r,dQ);
+T_total = trapz(r,dT); Q_total = trapz(r,dQ);
 P = omega*Q_total;
 Cp = P/(0.5*rho*A*U_inf^3);
 Ct = T_total/(0.5*rho*A*U_inf^2);
 end
 
+function Cp = computeCp(U,pitch_deg,omega,r,c,tw,airfoils,polars,mapKey, ...
+                         B,rho,mu,R,A,tol,max_it,relax,cap_a)
+[Cp,~] = runBEM_once(U,r,c,tw,airfoils,polars,mapKey, ...
+                     B,rho,mu,pitch_deg,omega,R,A,tol,max_it,relax,cap_a);
+end
+
 function [Cp,Ct,P,T_total] = bem_power_at_pitch(U,pitch_deg,omega, ...
     r,c,tw,airfoils,polars,mapKey,B,rho,mu,R,A,tol,max_it,relax,cap_a)
-% Helper for Deliverable 4.
-N=numel(r); dr=diff(r); dr=[dr;dr(end)];
-pitch=deg2rad(pitch_deg);
+N=numel(r); pitch=deg2rad(pitch_deg);
 dT=zeros(N,1); dQ=zeros(N,1);
-
 for i=1:N
     ri=r(i); ci=c(i); twi=tw(i); air=airfoils(i);
-    isCircle=strcmpi(air,'circle');
-    polKey=mapKey(air); hasPolar=isfield(polars,polKey);
-
+    isCircle=strcmpi(air,'circle'); polKey=mapKey(air); hasPolar=isfield(polars,polKey);
     a=0.3; ap=0;
     for it=1:max_it
         Vax=U*(1-a); Vtan=omega*ri*(1+ap); phi=atan2(Vax,Vtan);
         alpha_deg=rad2deg(phi-(twi+pitch));
-
         if ~isCircle && hasPolar
             Ptab=polars.(polKey);
             Cl=interp1(Ptab.alpha,Ptab.Cl,alpha_deg,'linear','extrap');
@@ -459,9 +383,8 @@ for i=1:N
         elseif ~isCircle && ~hasPolar
             [Cl,Cd]=fallbackPolar(alpha_deg);
         else
-            Re=rho*U*ci/mu; Cd=cylinderCD(Re); Cl=0;
+            Re=rho*U*ci/mu; Cl=0; Cd=cylinderCD(Re);
         end
-
         Cn=Cl*cos(phi)+Cd*sin(phi); Ct_loc=Cl*sin(phi)-Cd*cos(phi);
         sigma=B*ci/(2*pi*ri);
         f=(B/2)*(R-ri)/(ri*max(abs(sin(phi)),1e-6));
@@ -472,14 +395,12 @@ for i=1:N
         ap=(1-relax)*ap+relax*ap_new; ap=min(max(ap,-0.5),1.0);
         if abs(a-a_new)<tol && abs(ap-ap_new)<tol, break; end
     end
-
-    Vrel=hypot(U*(1-a),omega*ri*(1+ap)); 
+    Vrel=hypot(U*(1-a),omega*ri*(1+ap));
     dL=0.5*rho*Vrel^2*ci*Cl; dD=0.5*rho*Vrel^2*ci*Cd;
     dFx=dL*cos(phi)+dD*sin(phi);
-    dFt=(isCircle)*0+(~isCircle)*(dL*sin(phi)-dD*cos(phi));
+    dFt=(~isCircle)*(dL*sin(phi)-dD*cos(phi));
     dT(i)=B*dFx; dQ(i)=B*dFt*ri;
 end
-
 T_total=trapz(r,dT); Q_total=trapz(r,dQ);
 P=omega*Q_total; 
 Cp=P/(0.5*rho*A*U^3); 
@@ -487,52 +408,45 @@ Ct=T_total/(0.5*rho*A*U^2);
 end
 
 function WindTurbineTower_Analysis()
-% Steel tower with distributed wind load and hub thrust.
-
-% Inputs and material data
+% Steel tower with distributed wind load + hub thrust.
 rho = 1.1; mu = 1.8e-5;
 U_ref = 19.4; x_ref = 77.7; e = 1/7;
 E = 200e9; Fz = 1.65e5; Hub_H = 80.4;
 
-% Tower geometry from CSV (mm -> m)
+% Geometry from CSV (mm -> m)
 data = readmatrix('towerSpecs.csv');
 x_data = data(:,1)/1000;  OD = data(:,2)/1000;  t = data(:,3)/1000;
 
-% Interpolate geometry
+% Interpolate to a fine grid
 x = linspace(0.001, Hub_H, 500)'; 
 D = interp1(x_data, OD, x, 'linear', 'extrap');
 thk = interp1(x_data, t,  x, 'linear', 'extrap');
 
-% Wind profile, Reynolds number, and distributed drag
+% Wind profile and loads
 U = (x/x_ref).^e .* U_ref;
 Re = (rho.*U.*D)./mu;
 C_D = cylinderCD(Re);
-q = 0.5.*rho.*C_D.*U.^2.*D;      % [N/m]
-
-% Section stiffness (thin-walled tube)
+q = 0.5.*rho.*C_D.*U.^2.*D;      % N/m
 I = (pi/64).*(D.^4 - (D - 2*thk).^4);
 
-% Internal forces and deflections
-V_rxn = trapz(x,q) + Fz;                          % base shear
-M_rxn = trapz(x, q.*x) + Fz*((Hub_H-77.7)/2 + 77.7); % base moment
+% Shear, moment, slope, deflection (cantilever base at x=0)
+V_rxn = trapz(x,q) + Fz;
+M_rxn = trapz(x, q.*x) + Fz*((Hub_H-77.7)/2 + 77.7);
 V = cumtrapz(x, -q) + V_rxn;
 M = cumtrapz(x, V) - M_rxn;
-EI = E.*I;
-theta = cumtrapz(x, M./EI);
+theta = cumtrapz(x, M./(E.*I));
 delta = cumtrapz(x, theta);
 
-% Bending stress (outer fiber)
-sigma_b = (M.*(D/2))./I;         % [Pa]
-sigma_b_MPa = sigma_b/1e6;
+% Bending stress
+sigma_b = (M .* (D/2))./I; sigma_b_MPa = sigma_b/1e6;
 sigma_max = max(abs(sigma_b_MPa));
 
-% Base axial stress from hub thrust
-D_outer_base = D(1); t_base = thk(1);
-D_inner_base = D_outer_base - 2*t_base;
-A_base = (pi/4)*(D_outer_base^2 - D_inner_base^2);
+% Base axial stress from thrust
+D_o = D(1); t_b = thk(1); D_i = D_o - 2*t_b;
+A_base = (pi/4)*(D_o^2 - D_i^2);
 sigma_axial_base_MPa = (Fz / A_base)/1e6;
 
-% Simple safety checks
+% Safety factors
 Sy = 345; Su = 450; Ssy = 0.5*Sy;
 sigma_combined_base = max(sigma_b_MPa) + sigma_axial_base_MPa;
 sigma_vm_base = sqrt(sigma_combined_base.^2);
@@ -540,14 +454,16 @@ FS_VM = Sy / max(sigma_vm_base,1e-12);
 FS_MaxNormal = Sy / max(abs(sigma_combined_base),1e-12);
 FS_MaxShear  = Ssy / max(abs(sigma_combined_base)/2,1e-12);
 
-% Fatigue (Goodman) – simple alternating estimate
+% Simple Goodman fatigue estimate
 min_Stress = sigma_max * cosd(315 - 157.5);
 mean_Stress = (sigma_max + min_Stress)/2;
 alternating_Stress = abs(sigma_max - mean_Stress)/2;
 sigma_e = 0.5*Su;
 FS_goodman = 1 / ((alternating_Stress/sigma_e) + (mean_Stress/Su));
 
-% Minimal console summary
+% Print concise summary (now includes deflection line for your report)
+disp('--- Deliverable 5 ---');
+fprintf('Max tower deflection = %.6f m\n', max(abs(delta)));
 disp(['Max bending stress = ', num2str(sigma_max), ' MPa']);
 disp(['FS_yield ~ ', num2str(Sy / max(sigma_max,1e-12))]);
 disp(['FS_ultimate ~ ', num2str(Su / max(sigma_max,1e-12))]);
@@ -555,29 +471,20 @@ disp(['Goodman FS ~ ', num2str(FS_goodman)]);
 
 % Plots
 figure;
-subplot(5,1,1);
-plot(x, q, 'LineWidth', 1.5); grid on; box on; set(gca,'FontSize',12);
+subplot(5,1,1); plot(x,q,'LineWidth',1.5); grid on; box on;
 ylabel('Load (N/m)'); title('Deliverable 5 – Distributed Drag');
-
-subplot(5,1,2);
-plot(x, V, 'LineWidth', 1.5); grid on; box on; set(gca,'FontSize',12);
+subplot(5,1,2); plot(x,V,'LineWidth',1.5); grid on; box on;
 ylabel('Shear (N)'); title('Shear Force V');
-
-subplot(5,1,3);
-plot(x, M, 'LineWidth', 1.5); grid on; box on; set(gca,'FontSize',12);
+subplot(5,1,3); plot(x,M,'LineWidth',1.5); grid on; box on;
 ylabel('Moment (N·m)'); title('Bending Moment M');
-
-subplot(5,1,4);
-plot(x, theta, 'LineWidth', 1.5); grid on; box on; set(gca,'FontSize',12);
+subplot(5,1,4); plot(x,theta,'LineWidth',1.5); grid on; box on;
 ylabel('Slope (rad)'); title('Slope \theta');
-
-subplot(5,1,5);
-plot(x, delta, 'LineWidth', 1.5); grid on; box on; set(gca,'FontSize',12);
+subplot(5,1,5); plot(x,delta,'LineWidth',1.5); grid on; box on;
 ylabel('Deflection (m)'); xlabel('Height (m)'); title('Deflection \delta');
 
 figure;
-plot(x, sigma_b_MPa, 'LineWidth', 1.5);
-grid on; box on; set(gca,'FontSize',12);
+plot(x, sigma_b_MPa, 'LineWidth', 1.5); grid on; box on;
 xlabel('Height (m)'); ylabel('\sigma_{b,max} (MPa)');
 title('Deliverable 5 – Max Bending Stress Along Tower');
 end
+
