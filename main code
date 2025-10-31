@@ -94,8 +94,9 @@ for i = 1:N
         sigma = B*ci/(2*pi*ri);
         f = (B/2)*(R-ri)/(ri*max(abs(sin(phi)),1e-6));
         F = (2/pi)*acos(exp(-f)); F = max(F,1e-6);
-        a_new  = 1/(1+(4*F*sin(phi)^2)/(sigma*max(Cn,1e-6)));
-        ap_new = 1/((4*F*sin(phi)*cos(phi))/(sigma*max(Ct_loc,1e-6))-1);
+        eps = 1e-8;
+        a_new  = 1/(1+(4*F*sin(phi)^2)/(sigma*(sign(Cn)*max(abs(Cn),eps))));
+        ap_new = 1/((4*F*sin(phi)*cos(phi))/(sigma*(sign(Ct_loc)*max(abs(Ct_loc),eps))) - 1);
         a  = (1-relax)*a  + relax*a_new;  a  = min(max(a,0),cap_a);
         ap = (1-relax)*ap + relax*ap_new; ap = min(max(ap,-0.5),1.0);
         if abs(a-a_new)<tol && abs(ap-ap_new)<tol, break; end
@@ -162,7 +163,7 @@ for k = 1:numel(polarFiles)
     polars.(key).alpha = D.AoA; polars.(key).Cl = D.CL; polars.(key).Cd = D.CD;
 end
 
-pitch_range = -5:1:20;
+pitch_range = -3:0.1:20;
 Cp_list = zeros(length(pitch_range),1);
 for p = 1:length(pitch_range)
     Cp_list(p) = computeCp(U_inf, pitch_range(p), omega, r,c,tw,airfoils,polars,mapKey,B,rho,mu,R,A,tol,max_it,relax,cap_a);
@@ -274,7 +275,8 @@ for k = 1:numel(U_list)
         if PM > P_rated, lo = mid; else, hi = mid; end
         if abs(hi-lo) < 1e-3, break; end
     end
-    Pitch_req(k)=hi; Cp_at_req(k)=CpM; Ct_at_req(k)=CtM; P_at_req(k)=PM; T_at_req(k)=Tmid;
+    [CPH, CTH, PH, TH] = getPowerAtPitch(hi);
+    Pitch_req(k)=hi; Cp_at_req(k)=CPH; Ct_at_req(k)=CTH; P_at_req(k)=PH; T_at_req(k)=TH;
     lambda_at_req(k)=(omega_fix*R)/U;
 end
 
